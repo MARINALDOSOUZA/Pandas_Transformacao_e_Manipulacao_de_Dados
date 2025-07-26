@@ -1,0 +1,446 @@
+import pandas as pd
+import requests
+import re
+import logging
+import os
+from datetime import datetime
+import matplotlib.pyplot as plt
+import seaborn as sns
+import matplotlib.ticker as mticker
+import matplotlib.dates as mdates # Importar para formatação de data
+
+# --- LOGGING BÁSICO ---
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] %(levelname)s: %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+
+def texto_extenso_para_numero(texto):
+    unidades = {
+        'zero': 0, 'um': 1, 'uma': 1, 'dois': 2, 'duas': 2, 'três': 3, 'quatro': 4,
+        'cinco': 5, 'seis': 6, 'sete': 7, 'oito': 8, 'nove': 9
+    }
+    dezenas = {
+        'dez': 10, 'onze': 11, 'doze': 12, 'treze': 13, 'quatorze': 14, 'quinze': 15,
+        'dezesseis': 16, 'dezessete': 17, 'dezoito': 18, 'dezenove': 19,
+        'vinte': 20, 'trinta': 30, 'quarenta': 40, 'cinquenta': 50, 'sessenta': 60,
+        'setenta': 70, 'oitenta': 80, 'noventa': 90
+    }
+    centenas = {
+        'cem': 100, 'cento': 100, 'duzentos': 200, 'trezentos': 300, 'quatrocentos': 400,
+        'quinhentos': 500, 'seiscentos': 600, 'setecentos': 700,
+        'oitocentos': 800, 'novecentos': 900
+    }
+    milhares = {
+        'mil': 1000
+    }
+
+    palavras = texto.lower().split()
+    total = 0
+    atual = 0
+
+    for palavra in palavras:
+        if palavra in unidades:
+            atual += unidades[palavra]
+        elif palavra in dezenas:
+            atual += dezenas[palavra]
+        elif palavra in centenas:
+            atual += centenas[palavra]
+        elif palavra in milhares:
+            if atual == 0:
+                atual = 1
+            total += atual * milhares[palavra]
+            atual = 0
+        elif palavra == 'e':
+            continue
+        else:
+            return None
+
+    return total + atual if total + atual > 0 else None
+
+def extrair_dataframe(json_obj):
+    if isinstance(json_obj, list):
+        df = pd.json_normalize(json_obj)
+    elif isinstance(json_obj, dict):
+        for k, v in json_obj.items():
+            if isinstance(v, list) and len(v) > 0 and isinstance(v[0], dict):
+                df = pd.json_normalize(v)
+                break
+        else:
+            df = pd.json_normalize(json_obj)
+    else:
+        raise ValueError("Formato JSON inválido")
+
+    colunas_para_explodir = [col for col in df.columns if df[col].apply(lambda x: isinstance(x, list)).any()]
+    for col in colunas_para_explodir:
+        df = df.explode(col).reset_index(drop=True)
+
+    return df
+
+def tratar_dados_especificos(df):
+    df_tratado = df.copy()
+
+    for col in df_tratado.columns:
+        dados = df_tratado[col]
+
+        if re.search(r'data|date|dt', col, re.IGNORECASE):
+            df_tratado[col] = pd.to_datetime(dados, errors='coerce', dayfirst=True)
+
+        elif col == 'valor_aluguel':
+            valores = []
+
+            for val in dados.astype(str):
+                original = val.lower().strip()
+                val_limpo = re.sub(r'[^\d,\.]', '', original)
+                val_limpo = val_limpo.replace(',', '.')
+
+                try:
+                    valores.append(float(val_limpo))
+                    continue
+                except ValueError:
+                    pass
+
+                val_texto = re.sub(r'[^a-záéíóúãõç\s]', '', original)
+                numero = texto_extenso_para_numero(val_texto)
+                valores.append(float(numero) if numero is not None else None)
+
+            df_tratado[col] = pd.Series(valores)
+
+        elif dados.dtype == 'object':
+            df_tratado[col] = dados.str.strip().str.title()
+
+    return df_tratado
+
+def relatorio_validacao(df_original, df_tratado):
+    total_rows = len(df_original)
+    total_cols_original = df_original.shape[1] # Número de colunas no DF original
+
+    aproveitadas_rows = len(df_tratado.dropna(how='all'))
+    descartadas_rows = total_rows - aproveitadas_rows
+
+    # Número de colunas no DataFrame tratado
+    # Note que no pipeline atual, `tratar_dados_especificos` não remove colunas,
+    # então este valor deve ser o mesmo que total_cols_original.
+    aproveitadas_cols = df_tratado.shape[1]
+    descartadas_cols = total_cols_original - aproveitadas_cols # Será 0 na maioria dos casos
+
+    print("\n--- RELATÓRIO DE VALIDAÇÃO ---")
+    print(f"Linhas totais no JSON original: {total_rows}")
+    print(f"Colunas totais no JSON original: {total_cols_original}")
+    print(f"Linhas aproveitadas: {aproveitadas_rows} ({(aproveitadas_rows / total_rows) * 100:.2f}%)")
+    print(f"Colunas aproveitadas: {aproveitadas_cols}")
+    print(f"Linhas descartadas: {descartadas_rows} ({(descartadas_rows / total_rows) * 100:.2f}%)")
+    print(f"Colunas descartadas: {descartadas_cols}")
+
+    if descartadas_cols == 0 and aproveitadas_cols == total_cols_original:
+        print("(Nota: No processo de tratamento atual, colunas não são removidas, apenas seus valores são modificados.)")
+
+def criar_backup(arquivo_csv):
+    pasta_backup = 'backups'
+    if not os.path.exists(pasta_backup):
+        os.makedirs(pasta_backup)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    nome_backup = f"{os.path.splitext(arquivo_csv)[0]}_backup_{timestamp}.csv"
+    caminho_backup = os.path.join(pasta_backup, nome_backup)
+
+    if os.path.exists(arquivo_csv):
+        os.rename(arquivo_csv, caminho_backup)
+        logger.info(f"Backup criado: {caminho_backup}")
+    else:
+        logger.warning(f"Arquivo '{arquivo_csv}' não encontrado para backup.")
+
+def formatar_valor_brl(valor):
+    if pd.isna(valor):
+        return "R$ NaN"
+    else:
+        return f"R$ {valor:,.2f}".replace(',', 'v').replace('.', ',').replace('v', '.')
+
+def encontrar_coluna_por_regex(df, padrao):
+    for col in df.columns:
+        if re.search(padrao, col, re.IGNORECASE):
+            return col
+    return None
+
+def mostrar_visao_geral(df):
+    print("\n### VISÃO GERAL DO DATAFRAME ###")
+    total_linhas = len(df)
+    entrada = input("Digite o número de linhas para mostrar, intervalo (ex: 10:20) ou ENTER para 50 linhas: ").strip()
+
+    # Criar uma cópia para formatação e adição de coluna temporária
+    df_display = df.copy() 
+    
+    # Encontrar a coluna 'valor_aluguel' e aplicar a formatação
+    col_valor_aluguel = encontrar_coluna_por_regex(df_display, r'valor_aluguel')
+    if col_valor_aluguel and pd.api.types.is_numeric_dtype(df_display[col_valor_aluguel]):
+        df_display[col_valor_aluguel] = df_display[col_valor_aluguel].apply(formatar_valor_brl)
+
+    # --- INÍCIO DA MODIFICAÇÃO PARA A COLUNA FICTÍCIA ---
+    col_pagamento = encontrar_coluna_por_regex(df_display, r'datas_de_pagamento')
+    col_vencimento = encontrar_coluna_por_regex(df_display, r'datas_combinadas_pagamento')
+
+    if col_pagamento and col_vencimento:
+        # Garante que as colunas sejam datetime para a comparação
+        pagamentos = pd.to_datetime(df_display[col_pagamento], errors='coerce')
+        vencimentos = pd.to_datetime(df_display[col_vencimento], errors='coerce')
+
+        # Cria a coluna fictícia 'Status_Pagamento_Visual'
+        df_display['Status_Pagamento_Visual'] = 'N/A' # Default para onde as datas são inválidas
+
+        # Preenche 'Em dia' ou 'Atrasado'
+        # Apenas para linhas onde ambas as datas são válidas
+        valid_dates_mask = pagamentos.notna() & vencimentos.notna()
+        df_display.loc[valid_dates_mask, 'Status_Pagamento_Visual'] = (
+            (pagamentos[valid_dates_mask] <= vencimentos[valid_dates_mask])
+            .map({True: 'Em dia', False: 'Atrasado'})
+        )
+    else:
+        logger.warning("Colunas de data de pagamento ou vencimento não encontradas para criar o status visual.")
+    # --- FIM DA MODIFICAÇÃO PARA A COLUNA FICTÍCIA ---
+
+    try:
+        start, end = 0, 0
+        if entrada == '':
+            start, end = 0, 50
+        elif ':' in entrada:
+            parts = entrada.split(':')
+            start = int(parts[0]) if parts[0] else 0
+            end = int(parts[1]) if len(parts) > 1 and parts[1] else total_linhas
+        else:
+            start, end = 0, int(entrada)
+        
+        if start < 0: start = 0
+        if end > total_linhas: end = total_linhas
+        if start >= end:
+            print("Intervalo inválido ou vazio. Mostrando as primeiras 50 linhas.")
+            start, end = 0, min(50, total_linhas)
+
+        print(df_display.iloc[start:end].to_string(index=False)) # Imprime a cópia formatada
+    except ValueError:
+        print("Entrada inválida. Por favor, digite um número, um intervalo (ex: 10:20) ou ENTER.")
+    except Exception as e:
+        print(f"Ocorreu um erro: {e}")
+
+def mostrar_visao_financeira(df):
+    print("\n### VISÃO FINANCEIRA ###")
+
+    df_copy = df.copy()
+
+    col_pagamento = encontrar_coluna_por_regex(df_copy, r'datas_de_pagamento')
+    col_vencimento = encontrar_coluna_por_regex(df_copy, r'datas_combinadas_pagamento')
+    col_valor_aluguel = encontrar_coluna_por_regex(df_copy, r'valor_aluguel')
+
+    if not col_pagamento or not col_vencimento or not col_valor_aluguel:
+        print("Colunas necessárias (data de pagamento, vencimento e/ou valor do aluguel) não foram encontradas.")
+        print(f"Colunas disponíveis: {list(df_copy.columns)}")
+        return
+    
+    df_financeiro = df_copy[[col_pagamento, col_vencimento, col_valor_aluguel]].copy()
+    df_financeiro.columns = ['data_pagamento', 'data_vencimento', 'valor_aluguel']
+
+    df_financeiro['data_pagamento'] = pd.to_datetime(df_financeiro['data_pagamento'], errors='coerce')
+    df_financeiro['data_vencimento'] = pd.to_datetime(df_financeiro['data_vencimento'], errors='coerce')
+    df_financeiro['valor_aluguel'] = pd.to_numeric(df_financeiro['valor_aluguel'], errors='coerce')
+
+    df_financeiro.dropna(subset=['data_pagamento', 'data_vencimento', 'valor_aluguel'], inplace=True)
+
+    if df_financeiro.empty:
+        print("Não há dados válidos para a visão financeira após o tratamento das datas e valores.")
+        return
+
+    pag_em_dia = df_financeiro[df_financeiro['data_pagamento'] <= df_financeiro['data_vencimento']]
+    pag_atraso = df_financeiro[df_financeiro['data_pagamento'] > df_financeiro['data_vencimento']]
+    
+    total_apts_validos = len(df_financeiro)
+    total_alugueis_validos = df_financeiro['valor_aluguel'].sum()
+
+    print("\n--- RESUMO DOS PAGAMENTOS ---")
+    
+    # Pagamentos em dia
+    qtd_em_dia = len(pag_em_dia)
+    soma_aluguel_em_dia = pag_em_dia['valor_aluguel'].sum()
+    media_aluguel_em_dia = pag_em_dia['valor_aluguel'].mean() if qtd_em_dia > 0 else 0
+    
+    porc_apts_em_dia = (qtd_em_dia / total_apts_validos) * 100 if total_apts_validos > 0 else 0
+    porc_valor_em_dia = (soma_aluguel_em_dia / total_alugueis_validos) * 100 if total_alugueis_validos > 0 else 0
+
+    print(f"\n** Pagamentos Em Dia ou Adiantados **")
+    print(f"Total de Apartamentos: {qtd_em_dia} ({porc_apts_em_dia:.2f}%)")
+    print(f"Soma dos Valores de Aluguéis: {formatar_valor_brl(soma_aluguel_em_dia)}")
+    print(f"Média dos Valores de Aluguéis: {formatar_valor_brl(media_aluguel_em_dia)}")
+    print(f"Porcentagem do Total de Aluguéis Válidos: {porc_valor_em_dia:.2f}%")
+
+    # Pagamentos em atraso
+    qtd_atraso = len(pag_atraso)
+    soma_aluguel_atraso = pag_atraso['valor_aluguel'].sum()
+    media_aluguel_atraso = pag_atraso['valor_aluguel'].mean() if qtd_atraso > 0 else 0
+
+    porc_apts_atraso = (qtd_atraso / total_apts_validos) * 100 if total_apts_validos > 0 else 0
+    porc_valor_atraso = (soma_aluguel_atraso / total_alugueis_validos) * 100 if total_alugueis_validos > 0 else 0
+
+    print(f"\n** Pagamentos Atrasados **")
+    print(f"Total de Apartamentos: {qtd_atraso} ({porc_apts_atraso:.2f}%)")
+    print(f"Soma dos Valores de Aluguéis: {formatar_valor_brl(soma_aluguel_atraso)}")
+    print(f"Média dos Valores de Aluguéis: {formatar_valor_brl(media_aluguel_atraso)}")
+    print(f"Porcentagem do Total de Aluguéis Válidos: {porc_valor_atraso:.2f}%")
+
+    print(f"\nTotal Geral de Apartamentos Válidos para Análise: {total_apts_validos}")
+    print(f"Soma Total Geral de Aluguéis Válidos para Análise: {formatar_valor_brl(total_alugueis_validos)}")
+
+
+def mostrar_estatisticas(df):
+    print("\n### ESTATÍSTICAS DE PAGAMENTOS ###")
+
+    col_pagamento = encontrar_coluna_por_regex(df, r'datas_de_pagamento')
+    col_vencimento = encontrar_coluna_por_regex(df, r'datas_combinadas_pagamento')
+
+    if not col_pagamento or not col_vencimento:
+        print("Não foi possível encontrar colunas para gerar estatísticas.")
+        return
+
+    df_estatisticas = df.copy()
+    df_estatisticas['data_pagamento'] = pd.to_datetime(df_estatisticas[col_pagamento], errors='coerce')
+    df_estatisticas['data_vencimento'] = pd.to_datetime(df_estatisticas[col_vencimento], errors='coerce')
+
+    df_estatisticas.dropna(subset=['data_pagamento', 'data_vencimento'], inplace=True)
+
+    if df_estatisticas.empty:
+        print("Não há dados válidos para gerar estatísticas de pagamentos após o tratamento das datas.")
+        return
+
+    df_estatisticas['status_pagamento'] = df_estatisticas['data_pagamento'] <= df_estatisticas['data_vencimento']
+
+    # Agrupar por data de pagamento e status, contando a quantidade de ocorrências
+    pagamentos_diarios = df_estatisticas.groupby(['data_pagamento', 'status_pagamento']).size().unstack(fill_value=0)
+    pagamentos_diarios = pagamentos_diarios.sort_index()
+
+    sns.set(style="whitegrid")
+    fig, ax = plt.subplots(figsize=(14, 6)) # Usar fig, ax para melhor controle
+
+    # Plotar Pagamento em Dia
+    if True in pagamentos_diarios.columns and not pagamentos_diarios[True].empty:
+        pico_data = pagamentos_diarios[True].idxmax()
+        pico_valor = pagamentos_diarios[True].max()
+        
+        sns.lineplot(x=pagamentos_diarios.index, y=pagamentos_diarios[True], label='Pagamento Em Dia', color='blue', marker='o', ax=ax)
+        ax.scatter([pico_data], [pico_valor], color='blue', s=150, edgecolors='black', label=f'Pico Em Dia ({pico_data.strftime("%Y-%m-%d")}: {pico_valor})', zorder=5)
+
+    # Plotar Pagamento Atrasado
+    if False in pagamentos_diarios.columns and not pagamentos_diarios[False].empty:
+        pico_data_atraso = pagamentos_diarios[False].idxmax()
+        pico_valor_atraso = pagamentos_diarios[False].max()
+        
+        sns.lineplot(x=pagamentos_diarios.index, y=pagamentos_diarios[False], label='Pagamento Atrasado', color='red', marker='o', ax=ax)
+        ax.scatter([pico_data_atraso], [pico_valor_atraso], color='red', s=150, edgecolors='black', label=f'Pico Atrasado ({pico_data_atraso.strftime("%Y-%m-%d")}: {pico_valor_atraso})', zorder=5)
+
+    ax.set_title("Evolução de Pagamentos por Status")
+    ax.set_xlabel("Data do Pagamento")
+    ax.set_ylabel("Quantidade de Apartamentos")
+    ax.legend()
+    ax.grid(True, which='both', linestyle='--', linewidth=0.5)
+
+    # Melhorar a formatação do eixo X para datas
+    if not pagamentos_diarios.empty:
+        # Determine o intervalo de datas para decidir o formato
+        min_date = pagamentos_diarios.index.min()
+        max_date = pagamentos_diarios.index.max()
+        
+        # Diferença em dias
+        delta_days = (max_date - min_date).days
+
+        if delta_days < 90: # Menos de 3 meses, mostrar dias
+            ax.xaxis.set_major_locator(mdates.DayLocator(interval=7)) # Ticks a cada 7 dias
+            ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
+        elif delta_days < 365: # Menos de 1 ano, mostrar meses e dias
+            ax.xaxis.set_major_locator(mdates.MonthLocator())
+            ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+        else: # Mais de 1 ano, mostrar anos e meses
+            ax.xaxis.set_major_locator(mdates.YearLocator())
+            ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+            ax.xaxis.set_minor_locator(mdates.MonthLocator(interval=3)) # Ticks menores a cada 3 meses
+
+        # Correção do erro: 'ha' não é um argumento para tick_params diretamente, mas para os labels
+        ax.tick_params(axis='x', labelrotation=45) # Rotação dos labels do eixo X
+        plt.setp(ax.get_xticklabels(), ha='right') # Define o alinhamento horizontal para os rótulos do eixo X
+
+
+    plt.tight_layout()
+    plt.show()
+
+
+def processar_json_e_salvar(url, arquivo_csv):
+    """Função auxiliar para baixar, extrair, tratar e salvar o JSON."""
+    df_tratado_local = pd.DataFrame()
+    try:
+        logger.info("Baixando dados JSON...")
+        response = requests.get(url)
+        response.raise_for_status()
+        dados_json = response.json()
+
+        logger.info("Extraindo e tratando dados...")
+        df_raw = extrair_dataframe(dados_json)
+        df_tratado_local = tratar_dados_especificos(df_raw)
+        df_tratado_local.to_csv(arquivo_csv, index=False)
+
+        logger.info(f"Arquivo CSV salvo como {arquivo_csv}")
+        relatorio_validacao(df_raw, df_tratado_local)
+    except Exception as e:
+        logger.error(f"Erro durante processamento do JSON: {e}")
+        df_tratado_local = pd.DataFrame()
+    return df_tratado_local
+
+def main():
+    url = 'https://cdn3.gnarususercontent.com.br/2928-transformacao-manipulacao-dados/dados_locacao_imoveis.json'
+    arquivo_csv = 'df_locacao_imoveis.csv'
+
+    df_tratado = pd.DataFrame()
+
+    if not os.path.exists(arquivo_csv):
+        logger.info("Arquivo CSV não encontrado. Criando novo arquivo a partir do JSON.")
+        df_tratado = processar_json_e_salvar(url, arquivo_csv)
+    else:
+        resposta = input(f"O arquivo '{arquivo_csv}' já existe. Deseja atualizar? (s/n): ").strip().lower()
+        if resposta != 's':
+            logger.info(f"Carregando arquivo existente '{arquivo_csv}'...")
+            try:
+                df_tratado = pd.read_csv(arquivo_csv)
+                for col in df_tratado.columns:
+                    if re.search(r'data|date|dt', col, re.IGNORECASE):
+                        df_tratado[col] = pd.to_datetime(df_tratado[col], errors='coerce', dayfirst=True)
+            except Exception as e:
+                logger.error(f"Erro ao carregar o arquivo CSV: {e}. Tentando baixar novamente.")
+                df_tratado = processar_json_e_salvar(url, arquivo_csv)
+        else:
+            criar_backup(arquivo_csv)
+            df_tratado = processar_json_e_salvar(url, arquivo_csv)
+
+    if not df_tratado.empty:
+        menu(df_tratado)
+    else:
+        logger.error("Não foi possível carregar ou processar os dados. Encerrando.")
+
+def menu(df):
+    while True:
+        print("\n=== MENU PRINCIPAL ===")
+        print("1 - Visão Geral")
+        print("2 - Visão Financeira")
+        print("3 - Estatísticas")
+        print("0 - Sair")
+        opcao = input("Escolha uma opção: ").strip()
+
+        if opcao == '1':
+            mostrar_visao_geral(df)
+        elif opcao == '2':
+            mostrar_visao_financeira(df)
+        elif opcao == '3':
+            mostrar_estatisticas(df)
+        elif opcao == '0':
+            print("Encerrando programa.")
+            break
+        else:
+            print("Opção inválida. Tente novamente.")
+
+if __name__ == "__main__":
+    main()
